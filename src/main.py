@@ -5,12 +5,14 @@ import os
 import re
 import signal
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional
 
 from tools import (
     AgencyRoutingTool as RawAgencyRoutingTool,
+    PublicServiceSearchTool as RawPublicServiceSearchTool,
     RegionNormalizeTool as RawRegionNormalizeTool,
     RequestClassifierTool as RawRequestClassifierTool,
     RequirementAndDraftTool as RawRequirementAndDraftTool,
@@ -100,7 +102,8 @@ class ExecutionTimeout:
 class OpenAIExecutionLogger:
     def __init__(self, user_input: str, base_dir: str = "logs/openai_sdk") -> None:
         self.user_input = user_input
-        self.started_at = _iso_now()
+        self.started_dt = datetime.now().astimezone()
+        self.started_at = self.started_dt.isoformat()
         self.tool_index = 0
         self.tool_records: list[dict[str, Any]] = []
         self.tool_signatures: set[str] = set()
@@ -132,15 +135,25 @@ class OpenAIExecutionLogger:
         self.tool_signatures.add(signature)
         return False
 
-    def log_tool_call(self, tool_name: str, arguments: dict[str, Any], result: dict[str, Any]) -> None:
+    def log_tool_call(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: dict[str, Any],
+        latency_ms: Optional[int] = None,
+        step_type: str = "tool_call",
+    ) -> None:
         self.tool_index += 1
         record = {
             "index": self.tool_index,
+            "type": step_type,
             "selected_tool": tool_name,
             "tool_arguments": arguments,
             "tool_result": result,
             "logged_at": _iso_now(),
         }
+        if latency_ms is not None:
+            record["latency_ms"] = latency_ms
         self.tool_records.append(record)
         path = self.tool_calls_dir / f"{self.tool_index:02d}_{tool_name}.json"
         path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -154,15 +167,19 @@ class OpenAIExecutionLogger:
             }
         )
 
-    def finalize(self, final_answer: str, raw_result: dict[str, Any]) -> None:
+    def finalize(self, final_answer: str, raw_result: dict[str, Any], stop_reason: str) -> None:
+        completed_dt = datetime.now().astimezone()
+        total_latency_ms = int((completed_dt - self.started_dt).total_seconds() * 1000)
         payload = {
             "user_input": self.user_input,
             "conversation_turns": self.conversation_turns,
             "tool_call_sequence": [record["selected_tool"] for record in self.tool_records],
             "tool_calls": self.tool_records,
             "final_answer": final_answer,
+            "stop_reason": stop_reason,
             "started_at": self.started_at,
-            "completed_at": _iso_now(),
+            "completed_at": completed_dt.isoformat(),
+            "total_latency_ms": total_latency_ms,
             "raw_result": raw_result,
         }
         (self.run_dir / "run.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -192,6 +209,14 @@ class OpenAIExecutionLogger:
                 "## final answer",
                 "",
                 payload["final_answer"],
+                "",
+                "## stop reason",
+                "",
+                payload["stop_reason"],
+                "",
+                "## total latency",
+                "",
+                f"{payload['total_latency_ms']} ms",
             ]
         )
 
@@ -225,12 +250,12 @@ def build_openai_agent(model: Optional[str] = None, logger: Optional[OpenAIExecu
                 "message": "같은 Tool을 같은 입력으로 반복 호출할 수 없습니다. 현재까지 확보한 정보만으로 답변을 마무리하세요.",
             },
         }
-        logger.log_tool_call(tool_name, arguments, result)
+        logger.log_tool_call(tool_name, arguments, result, latency_ms=0)
         return json.dumps(result, ensure_ascii=False)
 
     def _finalize_tool_result(tool_name: str, arguments: dict[str, Any], result: dict[str, Any]) -> str:
         if logger is not None:
-            logger.log_tool_call(tool_name, arguments, result)
+            logger.log_tool_call(tool_name, arguments, result, latency_ms=0)
         return json.dumps(result, ensure_ascii=False)
 
     @function_tool(name_override="RequestClassifierTool")
@@ -240,8 +265,10 @@ def build_openai_agent(model: Optional[str] = None, logger: Optional[OpenAIExecu
         if blocked is not None:
             return blocked
 
+        started = time.perf_counter()
         result = RawRequestClassifierTool(message)
-        return _finalize_tool_result("RequestClassifierTool", arguments, result)
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return _finalize_tool_result("RequestClassifierTool", arguments, result, latency_ms=latency_ms)
 
     @function_tool(name_override="RegionNormalizeTool")
     def region_normalize_tool(region_text: str) -> str:
@@ -250,8 +277,10 @@ def build_openai_agent(model: Optional[str] = None, logger: Optional[OpenAIExecu
         if blocked is not None:
             return blocked
 
+        started = time.perf_counter()
         result = RawRegionNormalizeTool(region_text)
-        return _finalize_tool_result("RegionNormalizeTool", arguments, result)
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return _finalize_tool_result("RegionNormalizeTool", arguments, result, latency_ms=latency_ms)
 
     @function_tool(name_override="AgencyRoutingTool")
     def agency_routing_tool(
@@ -278,6 +307,7 @@ def build_openai_agent(model: Optional[str] = None, logger: Optional[OpenAIExecu
             if region_result["ok"]:
                 normalized_region = region_result["data"]
 
+        started = time.perf_counter()
         result = RawAgencyRoutingTool(
             response_type=response_type,
             category=category,
@@ -285,7 +315,35 @@ def build_openai_agent(model: Optional[str] = None, logger: Optional[OpenAIExecu
             keywords=keywords,
             normalized_region=normalized_region,
         )
-        return _finalize_tool_result("AgencyRoutingTool", arguments, result)
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return _finalize_tool_result("AgencyRoutingTool", arguments, result, latency_ms=latency_ms)
+
+    @function_tool(name_override="PublicServiceSearchTool")
+    def public_service_search_tool(
+        category: str,
+        keywords: List[str],
+        region_text: Optional[str] = None,
+        profile_text: Optional[str] = None,
+    ) -> str:
+        arguments = {
+            "category": category,
+            "keywords": keywords,
+            "region_text": region_text,
+            "profile_text": profile_text,
+        }
+        blocked = _blocked_repeated_call("PublicServiceSearchTool", arguments)
+        if blocked is not None:
+            return blocked
+
+        started = time.perf_counter()
+        result = RawPublicServiceSearchTool(
+            category=category,
+            keywords=keywords,
+            region_text=region_text,
+            profile_text=profile_text,
+        )
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return _finalize_tool_result("PublicServiceSearchTool", arguments, result, latency_ms=latency_ms)
 
     @function_tool(name_override="RequirementAndDraftTool")
     def requirement_and_draft_tool(
@@ -310,13 +368,15 @@ def build_openai_agent(model: Optional[str] = None, logger: Optional[OpenAIExecu
             "name": agency_name,
             "unit": agency_unit,
         }
+        started = time.perf_counter()
         result = RawRequirementAndDraftTool(
             category=category,
             agency=agency,
             user_input=user_input,
             want_draft=want_draft,
         )
-        return _finalize_tool_result("RequirementAndDraftTool", arguments, result)
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        return _finalize_tool_result("RequirementAndDraftTool", arguments, result, latency_ms=latency_ms)
 
     agent_kwargs = {
         "name": "Civil Petitions Navigator",
@@ -325,6 +385,7 @@ def build_openai_agent(model: Optional[str] = None, logger: Optional[OpenAIExecu
             request_classifier_tool,
             region_normalize_tool,
             agency_routing_tool,
+            public_service_search_tool,
             requirement_and_draft_tool,
         ],
     }
@@ -378,6 +439,17 @@ def _turn_requires_follow_up(result: dict[str, Any]) -> bool:
     if not tool_calls:
         return False
 
+    public_service_record = next(
+        (record for record in reversed(tool_calls) if record["selected_tool"] == "PublicServiceSearchTool"),
+        None,
+    )
+    if public_service_record is not None:
+        service_result = public_service_record.get("tool_result", {})
+        if service_result.get("ok"):
+            need_more_info = (service_result.get("data") or {}).get("need_more_info") or []
+            if need_more_info:
+                return True
+
     if any(
         record["selected_tool"] in {"AgencyRoutingTool", "RegionNormalizeTool", "RequirementAndDraftTool"}
         for record in tool_calls
@@ -408,6 +480,21 @@ def _turn_requires_follow_up(result: dict[str, Any]) -> bool:
     )
 
 
+def _infer_stop_reason(result: dict[str, Any], follow_up_required: bool = False) -> str:
+    if result.get("error") and "final_output" not in result:
+        return "runtime_error"
+    if follow_up_required:
+        return "follow_up_required"
+
+    tool_calls = result.get("turn_tool_calls", []) or []
+    for record in reversed(tool_calls):
+        tool_result = record.get("tool_result", {})
+        if not tool_result.get("ok", True):
+            return f"tool_error:{tool_result.get('error', {}).get('code', 'UNKNOWN')}"
+
+    return "final_answer"
+
+
 def _print_output(text: str) -> None:
     print(text)
 
@@ -433,15 +520,19 @@ def _run_interactive_session(initial_input: str, model: Optional[str] = None) ->
             logger.log_conversation_turn("assistant", final_output)
             _print_output(final_output)
 
-            if not _turn_requires_follow_up(result):
+            follow_up_required = _turn_requires_follow_up(result)
+            if not follow_up_required:
+                result["stop_reason"] = _infer_stop_reason(result, follow_up_required=False)
                 return result
 
             try:
                 follow_up = input("> ").strip()
             except EOFError:
+                result["stop_reason"] = "follow_up_abandoned"
                 return result
 
             if not follow_up:
+                result["stop_reason"] = "follow_up_abandoned"
                 return result
 
             logger.log_conversation_turn("user", follow_up)
@@ -451,6 +542,7 @@ def _run_interactive_session(initial_input: str, model: Optional[str] = None) ->
             "mode": "openai_agents_sdk",
             "input": current_input,
             "error": f"RuntimeError: 추가 질문 한도({MAX_FOLLOW_UP_ROUNDS})에 도달해 실행을 종료했습니다.",
+            "stop_reason": "follow_up_limit",
         }
         return last_result
     except Exception as exc:
@@ -458,11 +550,16 @@ def _run_interactive_session(initial_input: str, model: Optional[str] = None) ->
             "mode": "openai_agents_sdk",
             "input": current_input,
             "error": f"{type(exc).__name__}: {exc}",
+            "stop_reason": "runtime_error",
         }
         return last_result
     finally:
         if last_result is not None:
-            logger.finalize(last_result.get("final_output", last_result.get("error", "")), last_result)
+            logger.finalize(
+                last_result.get("final_output", last_result.get("error", "")),
+                last_result,
+                last_result.get("stop_reason", _infer_stop_reason(last_result)),
+            )
         if hasattr(session, "close"):
             session.close()
 

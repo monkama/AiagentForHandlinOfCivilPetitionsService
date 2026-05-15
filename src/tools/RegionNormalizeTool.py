@@ -12,6 +12,7 @@ from tools.schemas import ToolResult, failure, success
 
 API_URL = "http://apis.data.go.kr/1741000/StanReginCd/getStanReginCdList"
 SERVICE_KEY_ENV_NAMES = (
+    "REGION_CODE_API_KEY",
     "PUBLIC_DATA_SERVICE_KEY",
     "DATA_GO_KR_SERVICE_KEY",
     "GOV_DATA_SERVICE_KEY",
