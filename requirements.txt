@@ -1,3 +1,4 @@
 openai-agents
 eval_type_backport
 pydantic
+langchain-openai

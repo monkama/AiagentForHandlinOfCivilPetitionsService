@@ -1,0 +1,87 @@
+{
+  "user_input": "우리 동네 도로가 무너져서 차들이 위험해요.",
+  "conversation_turns": [
+    {
+      "role": "user",
+      "content": "우리 동네 도로가 무너져서 차들이 위험해요.",
+      "logged_at": "2026-05-29T20:05:36.452917+09:00"
+    },
+    {
+      "role": "assistant",
+      "content": "도로가 무너져 차량 안전에 큰 위험이 있다면 신속한 처리가 필요합니다. 해당 위치(동네 이름 또는 주소 등)를 알려주시면, 어떤 기관에 어떻게 신고해야 하는지 정확히 안내드릴 수 있습니다.\n\n도로가 무너진 위치를 알려주실 수 있나요?",
+      "logged_at": "2026-05-29T20:05:48.968633+09:00"
+    }
+  ],
+  "tool_call_sequence": [
+    "RequestClassifierTool"
+  ],
+  "tool_calls": [
+    {
+      "index": 1,
+      "type": "tool_call",
+      "selected_tool": "RequestClassifierTool",
+      "tool_arguments": {
+        "message": "우리 동네 도로가 무너져서 차들이 위험해요."
+      },
+      "tool_result": {
+        "ok": true,
+        "data": {
+          "response_type": "issue_resolution",
+          "category": "road_safety",
+          "urgency": "high",
+          "keywords": [
+            "도로",
+            "무너짐",
+            "위험",
+            "차량",
+            "안전"
+          ],
+          "needs_region": true,
+          "confidence": 0.9,
+          "region_text": null
+        },
+        "error": null
+      },
+      "token_usage": {
+        "input_tokens": 1214,
+        "output_tokens": 53,
+        "total_tokens": 1267,
+        "cached_input_tokens": 1024
+      },
+      "logged_at": "2026-05-29T20:05:47.635731+09:00",
+      "tool_model": "gpt-4o-mini",
+      "latency_ms": 3181
+    }
+  ],
+  "final_answer": "도로가 무너져 차량 안전에 큰 위험이 있다면 신속한 처리가 필요합니다. 해당 위치(동네 이름 또는 주소 등)를 알려주시면, 어떤 기관에 어떻게 신고해야 하는지 정확히 안내드릴 수 있습니다.\n\n도로가 무너진 위치를 알려주실 수 있나요?",
+  "stop_reason": "follow_up_abandoned",
+  "started_at": "2026-05-29T20:05:36.452917+09:00",
+  "completed_at": "2026-05-29T20:05:48.968736+09:00",
+  "total_latency_ms": 12515,
+  "total_token_usage": {
+    "input_tokens": 1214,
+    "output_tokens": 53,
+    "total_tokens": 1267,
+    "cached_input_tokens": 1024
+  },
+  "tool_statistics": [
+    {
+      "tool_name": "RequestClassifierTool",
+      "call_count": 1,
+      "latency_ms": 3181,
+      "token_usage": {
+        "input_tokens": 1214,
+        "output_tokens": 53,
+        "total_tokens": 1267,
+        "cached_input_tokens": 1024
+      }
+    }
+  ],
+  "raw_result": {
+    "mode": "openai_agents_sdk",
+    "input": "우리 동네 도로가 무너져서 차들이 위험해요.",
+    "last_agent": "Civil Petitions Navigator",
+    "final_output": "도로가 무너져 차량 안전에 큰 위험이 있다면 신속한 처리가 필요합니다. 해당 위치(동네 이름 또는 주소 등)를 알려주시면, 어떤 기관에 어떻게 신고해야 하는지 정확히 안내드릴 수 있습니다.\n\n도로가 무너진 위치를 알려주실 수 있나요?",
+    "stop_reason": "follow_up_abandoned"
+  }
+}

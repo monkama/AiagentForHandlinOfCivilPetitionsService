@@ -1,0 +1,34 @@
+{
+  "index": 1,
+  "type": "tool_call",
+  "selected_tool": "RequestClassifierTool",
+  "tool_arguments": {
+    "message": "회사에서 퇴직금을 안 줬는데 어디에 신고해야 하나요?"
+  },
+  "tool_result": {
+    "ok": true,
+    "data": {
+      "response_type": "issue_resolution",
+      "category": "labor",
+      "urgency": "high",
+      "keywords": [
+        "퇴직금",
+        "신고",
+        "임금체불",
+        "노동청"
+      ],
+      "needs_region": false,
+      "confidence": 0.9,
+      "region_text": null
+    },
+    "error": null
+  },
+  "token_usage": {
+    "input_tokens": 1215,
+    "output_tokens": 52,
+    "total_tokens": 1267
+  },
+  "logged_at": "2026-05-29T19:57:22.509696+09:00",
+  "tool_model": "gpt-4o-mini",
+  "latency_ms": 2448
+}

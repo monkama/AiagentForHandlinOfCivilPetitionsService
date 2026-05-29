@@ -1,0 +1,84 @@
+{
+  "user_input": "우리 동네 도로가 무너져서 차들이 위험해요.",
+  "conversation_turns": [
+    {
+      "role": "user",
+      "content": "우리 동네 도로가 무너져서 차들이 위험해요.",
+      "logged_at": "2026-05-29T20:11:44.340315+09:00"
+    },
+    {
+      "role": "assistant",
+      "content": "도로 붕괴 위치(동, 읍, 면 또는 구체적인 지역명)를 알려주시면, 관할 기관에 어떻게 신고해야 하는지 안내드리겠습니다. 도로가 무너진 지역을 상세히 말씀해주시겠어요? \n\n위급한 상황이라면 112 또는 119로도 즉시 신고하실 수 있습니다.",
+      "logged_at": "2026-05-29T20:11:50.763985+09:00"
+    }
+  ],
+  "tool_call_sequence": [
+    "RequestClassifierTool"
+  ],
+  "tool_calls": [
+    {
+      "index": 1,
+      "type": "tool_call",
+      "selected_tool": "RequestClassifierTool",
+      "tool_arguments": {
+        "message": "우리 동네 도로가 무너져서 차들이 위험해요."
+      },
+      "tool_result": {
+        "ok": true,
+        "data": {
+          "response_type": "issue_resolution",
+          "category": "road_safety",
+          "urgency": "high",
+          "keywords": [
+            "도로",
+            "무너짐",
+            "위험",
+            "차량",
+            "안전"
+          ],
+          "needs_region": true,
+          "confidence": 0.9,
+          "region_text": null
+        },
+        "error": null
+      },
+      "token_usage": {
+        "input_tokens": 1214,
+        "output_tokens": 53,
+        "total_tokens": 1267
+      },
+      "logged_at": "2026-05-29T20:11:49.234129+09:00",
+      "tool_model": "gpt-4o-mini",
+      "latency_ms": 3219
+    }
+  ],
+  "final_answer": "도로 붕괴 위치(동, 읍, 면 또는 구체적인 지역명)를 알려주시면, 관할 기관에 어떻게 신고해야 하는지 안내드리겠습니다. 도로가 무너진 지역을 상세히 말씀해주시겠어요? \n\n위급한 상황이라면 112 또는 119로도 즉시 신고하실 수 있습니다.",
+  "stop_reason": "follow_up_abandoned",
+  "started_at": "2026-05-29T20:11:44.340315+09:00",
+  "completed_at": "2026-05-29T20:11:50.764048+09:00",
+  "total_latency_ms": 6423,
+  "total_token_usage": {
+    "input_tokens": 1214,
+    "output_tokens": 53,
+    "total_tokens": 1267
+  },
+  "tool_statistics": [
+    {
+      "tool_name": "RequestClassifierTool",
+      "call_count": 1,
+      "latency_ms": 3219,
+      "token_usage": {
+        "input_tokens": 1214,
+        "output_tokens": 53,
+        "total_tokens": 1267
+      }
+    }
+  ],
+  "raw_result": {
+    "mode": "openai_agents_sdk",
+    "input": "우리 동네 도로가 무너져서 차들이 위험해요.",
+    "last_agent": "Civil Petitions Navigator",
+    "final_output": "도로 붕괴 위치(동, 읍, 면 또는 구체적인 지역명)를 알려주시면, 관할 기관에 어떻게 신고해야 하는지 안내드리겠습니다. 도로가 무너진 지역을 상세히 말씀해주시겠어요? \n\n위급한 상황이라면 112 또는 119로도 즉시 신고하실 수 있습니다.",
+    "stop_reason": "follow_up_abandoned"
+  }
+}

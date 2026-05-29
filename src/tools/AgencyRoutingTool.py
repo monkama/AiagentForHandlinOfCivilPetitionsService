@@ -2,15 +2,24 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, List
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 from pydantic import BaseModel
 
-from tools.schemas import ToolResult, failure, success
+from tools.minwon_pageindex_tree import (
+    get_department_catalog,
+    get_ministry_catalog,
+    get_records_in_scopes,
+    write_search_log,
+)
+from tools.schemas import ToolResult, failure, merge_token_usage, normalize_token_usage, success
 
 
 ORG_CODE_API_URL = "http://apis.data.go.kr/1741000/StanOrgCd2/getStanOrgCdList2"
@@ -20,24 +29,32 @@ ORG_CODE_SERVICE_KEY_ENV_NAMES = (
     "DATA_GO_KR_SERVICE_KEY",
     "GOV_DATA_SERVICE_KEY",
 )
+MAX_RECORDS_PER_SCOPE = 25
+
+
+class _MinistrySelection(BaseModel):
+    selected_ministry_names: List[str]
+    reason: str
+
+
+class _DepartmentSelection(BaseModel):
+    selected_scope_keys: List[str]
+    reason: str
 
 
 class _RoutingDecision(BaseModel):
-    selected_candidate_ids: List[str]
+    selected_record_ids: List[str]
     confidence: float
     routing_reason: str
 
 
-def _build_openai_client():
-    try:
-        from openai import OpenAI
-    except ImportError:
-        return None
-
+def _build_router_llm() -> ChatOpenAI | None:
     if not os.environ.get("OPENAI_API_KEY"):
         return None
-
-    return OpenAI()
+    return ChatOpenAI(
+        model=os.environ.get("OPENAI_ROUTER_MODEL", "gpt-4o-mini"),
+        temperature=0,
+    )
 
 
 def _read_prompt(filename: str) -> str:
@@ -125,258 +142,534 @@ def _region_label(normalized_region: dict[str, Any] | None) -> str | None:
     return None
 
 
-def _build_candidate_catalog(
-    response_type: str,
-    category: str,
-    urgency: str,
-    normalized_region: dict[str, Any] | None,
-) -> list[dict[str, Any]]:
-    region_label = _region_label(normalized_region)
-    residence_unit = f"{region_label} 관할 행정복지센터" if region_label else "전입지 관할 행정복지센터"
-    road_unit = f"{region_label} 도로관리부서" if region_label else "관할 도로관리부서"
-    env_unit = f"{region_label} 환경부서" if region_label else "관할 환경부서"
-    food_unit = f"{region_label} 위생부서" if region_label else "관할 위생부서"
+def _truncate(text: str, limit: int) -> str:
+    normalized = " ".join(str(text or "").split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 1].rstrip() + "…"
 
-    catalog_by_category: dict[str, list[dict[str, Any]]] = {
-        "labor": [
-            {
-                "id": "labor_moel",
-                "agency_name": "고용노동부",
-                "verification_name": "고용노동부",
-                "local_unit": "관할 지방고용노동관서",
-                "channels": [
-                    "고용노동부 고객상담센터 1350",
-                    "고용노동부 홈페이지 민원/진정 접수",
-                    "관할 지방고용노동관서 방문",
-                ]
-            },
-            {
-                "id": "labor_portal",
-                "agency_name": "국민권익위원회",
-                "verification_name": "국민권익위원회",
-                "local_unit": "국민신문고",
-                "channels": ["국민신문고 온라인 민원 접수"]
-            },
-        ],
-        "residence": [
-            {
-                "id": "residence_main",
-                "agency_name": "행정안전부",
-                "verification_name": "행정안전부",
-                "local_unit": residence_unit,
-                "channels": [
-                    "정부24 온라인 신청",
-                    f"{residence_unit} 방문",
-                ]
-            },
-        ],
-        "road_safety": [
-            {
-                "id": "road_emergency",
-                "agency_name": "긴급신고",
-                "verification_name": None,
-                "local_unit": "112 또는 119",
-                "channels": ["즉시 112 신고", "즉시 119 신고"]
-            },
-            {
-                "id": "road_local",
-                "agency_name": "지방자치단체",
-                "verification_name": None,
-                "local_unit": road_unit,
-                "channels": [
-                    "안전신문고 신고",
-                    f"{road_unit} 문의",
-                    "관할 지자체 민원실 문의",
-                ]
-            },
-        ],
-        "food_safety": [
-            {
-                "id": "food_local",
-                "agency_name": "식품의약품안전처",
-                "verification_name": "식품의약품안전처",
-                "local_unit": food_unit,
-                "channels": [
-                    "식품안전나라 또는 관할 위생부서 신고",
-                    f"{food_unit} 문의",
-                ]
-            },
-        ],
-        "environment": [
-            {
-                "id": "environment_local",
-                "agency_name": "환경부",
-                "verification_name": "환경부",
-                "local_unit": env_unit,
-                "channels": [
-                    f"{env_unit} 민원 접수",
-                    "국민신문고 온라인 민원 접수",
-                ]
-            },
-        ],
-        "tax": [
-            {
-                "id": "tax_nts",
-                "agency_name": "국세청",
-                "verification_name": "국세청",
-                "local_unit": "관할 세무서",
-                "channels": [
-                    "홈택스 온라인 신청/문의",
-                    "관할 세무서 방문 또는 전화 문의",
-                ]
-            },
-        ],
-        "housing": [
-            {
-                "id": "housing_molit",
-                "agency_name": "국토교통부",
-                "verification_name": "국토교통부",
-                "local_unit": "지자체 주택부서 또는 주거복지센터",
-                "channels": [
-                    "국토교통부/지자체 주거민원 채널",
-                    "주거복지센터 또는 관할 지자체 문의",
-                ]
-            },
-        ],
-    }
 
-    if category in catalog_by_category:
-        candidates = catalog_by_category[category]
-    elif response_type == "administrative_procedure":
-        candidates = [
-            {
-                "id": "procedure_generic",
-                "agency_name": "행정안전부",
-                "verification_name": "행정안전부",
-                "local_unit": region_label + " 관할 행정기관" if region_label else "관할 행정기관",
-                "channels": ["정부24", "관할 행정기관 민원 창구"]
-            },
+def _serialize_records_for_llm(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "record_id": record["record_id"],
+            "scope_key": record.get("scope_key"),
+            "분류번호": record.get("분류번호"),
+            "사무명": record.get("사무명"),
+            "사무개요": _truncate(record.get("사무개요", ""), 320),
+            "소관부처": record.get("소관부처"),
+            "담당부서": record.get("담당부서"),
+        }
+        for record in records
+    ]
+
+
+def _serialize_department_catalog(catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "scope_key": item["scope_key"],
+        }
+        for item in catalog
+    ]
+
+
+def _serialize_ministry_catalog(catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "ministry_name": item["ministry_name"],
+        }
+        for item in catalog
+    ]
+
+
+def _split_channels(text: str) -> list[str]:
+    normalized = str(text or "").replace("\r", "\n")
+    parts = re.split(r"[,/\n]+", normalized)
+    channels: list[str] = []
+    for part in parts:
+        value = " ".join(part.strip().split())
+        if value and value not in channels:
+            channels.append(value)
+    return channels
+
+
+def _extract_receiving_unit(record: dict[str, Any]) -> str | None:
+    process = str(record.get("접수/처리") or "")
+    for line in process.splitlines():
+        if "*접수:" not in line:
+            continue
+        unit = line.split("*접수:", 1)[1]
+        unit = re.sub(r"\([^)]*\)", "", unit).strip()
+        if unit:
+            return unit
+    department = str(record.get("담당부서") or "").strip()
+    return department or None
+
+
+def _extract_channels(record: dict[str, Any]) -> list[str]:
+    channels: list[str] = []
+    for value in _split_channels(str(record.get("접수방법") or "")):
+        if value not in channels:
+            channels.append(value)
+
+    receiving_unit = _extract_receiving_unit(record)
+    if receiving_unit:
+        receiving_channel = f"{receiving_unit} 접수"
+        if receiving_channel not in channels:
+            channels.append(receiving_channel)
+
+    if not channels:
+        channels.append("상세 접수방법 확인 필요")
+    return channels
+
+
+def _aggregate_related_laws(records: list[dict[str, Any]]) -> list[str]:
+    laws: list[str] = []
+    for record in records:
+        text = str(record.get("근거법령") or "")
+        for line in text.splitlines():
+            value = " ".join(line.strip().split())
+            if value and value not in laws:
+                laws.append(value)
+    return laws[:8]
+
+
+def _aggregate_required_documents(records: list[dict[str, Any]]) -> list[str]:
+    documents: list[str] = []
+    ignored_prefixes = (
+        "1. 기본서류",
+        "1. 유형없음",
+        "< 민원인 제출서류 >",
+        "< 공무원확인사항 >",
+    )
+    ignored_contains = (
+        "구비서류 없음",
+    )
+
+    for record in records:
+        text = str(record.get("구비서류") or "")
+        for raw_line in text.splitlines():
+            value = " ".join(raw_line.strip().split())
+            if not value:
+                continue
+            if any(value.startswith(prefix) for prefix in ignored_prefixes):
+                continue
+            if any(token in value for token in ignored_contains):
+                continue
+            value = re.sub(r"^\(\d+\)\s*", "", value)
+            value = re.sub(r"^\d+\.\s*", "", value)
+            value = value.strip()
+            if not value:
+                continue
+            if value not in documents:
+                documents.append(value)
+
+    return documents[:8]
+
+
+def _build_search_query(user_input: str, keywords: list[str]) -> str:
+    normalized_user_input = " ".join(user_input.strip().split())
+    if normalized_user_input:
+        return normalized_user_input
+    return " ".join(keyword.strip() for keyword in keywords if keyword.strip())
+
+
+def _raw_message_token_usage(raw_message: Any) -> dict[str, int]:
+    usage = getattr(raw_message, "usage_metadata", None)
+    if usage is None and hasattr(raw_message, "response_metadata"):
+        response_metadata = getattr(raw_message, "response_metadata", {}) or {}
+        usage = response_metadata.get("token_usage")
+
+    if hasattr(usage, "model_dump"):
+        usage = usage.model_dump()
+
+    if not isinstance(usage, dict):
+        return {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    return normalize_token_usage(
+        {
+            "input_tokens": usage.get("input_tokens", usage.get("prompt_tokens", 0)),
+            "output_tokens": usage.get("output_tokens", usage.get("completion_tokens", 0)),
+            "total_tokens": usage.get("total_tokens"),
+            "reasoning_tokens": usage.get("reasoning_tokens", (usage.get("output_token_details") or {}).get("reasoning")),
+            "cached_input_tokens": usage.get(
+                "cached_input_tokens",
+                (usage.get("input_token_details") or {}).get("cache_read", 0),
+            ),
+        }
+    )
+
+
+def _invoke_structured_llm(
+    structured_llm: Any,
+    instructions: str,
+    payload: dict[str, Any],
+) -> tuple[Any | None, dict[str, int]]:
+    response = structured_llm.invoke(
+        [
+            SystemMessage(content=instructions),
+            HumanMessage(content=json.dumps(payload, ensure_ascii=False, indent=2)),
         ]
-    else:
-        candidates = [
-            {
-                "id": "generic_portal",
-                "agency_name": "국민권익위원회",
-                "verification_name": "국민권익위원회",
-                "local_unit": "국민신문고",
-                "channels": ["국민신문고 온라인 민원 접수"]
-            },
-        ]
+    )
 
-    if category == "road_safety" and urgency != "emergency":
-        candidates = [candidate for candidate in candidates if candidate["id"] != "road_emergency"]
+    if not isinstance(response, dict):
+        return response, {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
 
-    return candidates
+    raw = response.get("raw")
+    parsed = response.get("parsed")
+    parsing_error = response.get("parsing_error")
+    token_usage = _raw_message_token_usage(raw)
+
+    if parsing_error is not None or parsed is None:
+        return None, token_usage
+
+    return parsed, token_usage
 
 
-def _llm_route(
+def _llm_select_ministries(
     *,
+    user_input: str,
     response_type: str,
     category: str,
     urgency: str,
     keywords: list[str],
     normalized_region: dict[str, Any] | None,
-    catalog: list[dict[str, Any]],
-) -> _RoutingDecision | None:
-    client = _build_openai_client()
-    if client is None:
-        return None
+    ministry_catalog: list[dict[str, Any]],
+) -> tuple[_MinistrySelection | None, dict[str, int]]:
+    llm = _build_router_llm()
+    if llm is None:
+        return None, {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
 
-    instructions = _read_prompt("agency_routing_instructions.txt")
-    model = os.environ.get("OPENAI_ROUTER_MODEL", "gpt-4o-mini")
-
-    response = client.responses.parse(
-        model=model,
-        input=[
-            {"role": "system", "content": instructions},
-            {
-                "role": "user",
-                "content": json.dumps(
-                    {
-                        "response_type": response_type,
-                        "category": category,
-                        "urgency": urgency,
-                        "keywords": keywords,
-                        "normalized_region": normalized_region,
-                        "candidate_catalog": catalog,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
-            },
-        ],
-        text_format=_RoutingDecision,
-        temperature=0,
-        max_output_tokens=400,
+    instructions = _read_prompt("agency_routing_ministry_selection_instructions.txt")
+    structured_llm = llm.with_structured_output(_MinistrySelection, include_raw=True)
+    return _invoke_structured_llm(
+        structured_llm,
+        instructions,
+        {
+            "user_input": user_input,
+            "response_type": response_type,
+            "category": category,
+            "urgency": urgency,
+            "keywords": keywords,
+            "normalized_region": normalized_region,
+            "available_ministries": _serialize_ministry_catalog(ministry_catalog),
+        },
     )
 
-    return response.output_parsed
+
+def _llm_select_departments(
+    *,
+    user_input: str,
+    response_type: str,
+    category: str,
+    urgency: str,
+    keywords: list[str],
+    normalized_region: dict[str, Any] | None,
+    selected_ministry_names: list[str],
+    department_catalog: list[dict[str, Any]],
+) -> tuple[_DepartmentSelection | None, dict[str, int]]:
+    llm = _build_router_llm()
+    if llm is None:
+        return None, {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    instructions = _read_prompt("agency_routing_department_selection_instructions.txt")
+    structured_llm = llm.with_structured_output(_DepartmentSelection, include_raw=True)
+    return _invoke_structured_llm(
+        structured_llm,
+        instructions,
+        {
+            "user_input": user_input,
+            "response_type": response_type,
+            "category": category,
+            "urgency": urgency,
+            "keywords": keywords,
+            "normalized_region": normalized_region,
+            "selected_ministry_names": selected_ministry_names,
+            "available_department_scopes": _serialize_department_catalog(department_catalog),
+        },
+    )
+
+
+def _llm_route(
+    *,
+    user_input: str,
+    response_type: str,
+    category: str,
+    urgency: str,
+    keywords: list[str],
+    normalized_region: dict[str, Any] | None,
+    retrieved_records: list[dict[str, Any]],
+) -> tuple[_RoutingDecision | None, dict[str, int]]:
+    llm = _build_router_llm()
+    if llm is None:
+        return None, {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
+
+    instructions = _read_prompt("agency_routing_instructions.txt")
+    structured_llm = llm.with_structured_output(_RoutingDecision, include_raw=True)
+    return _invoke_structured_llm(
+        structured_llm,
+        instructions,
+        {
+            "user_input": user_input,
+            "response_type": response_type,
+            "category": category,
+            "urgency": urgency,
+            "keywords": keywords,
+            "normalized_region": normalized_region,
+            "candidate_records": _serialize_records_for_llm(retrieved_records),
+        },
+    )
 
 
 def AgencyRoutingTool(
     *,
+    user_input: str,
     response_type: str,
     category: str,
     urgency: str,
     keywords: list[str],
     normalized_region: dict[str, Any] | None = None,
 ) -> ToolResult:
-    catalog = _build_candidate_catalog(response_type, category, urgency, normalized_region)
-    if not catalog:
-        return failure("NO_ROUTE_FOUND", "현재 조건에 맞는 기관 후보 카탈로그를 구성하지 못했습니다.")
+    search_query = _build_search_query(user_input, keywords)
+    if not search_query:
+        return failure("NO_ROUTE_FOUND", "민원 검색에 사용할 사용자 질의가 비어 있습니다.")
 
-    decision = _llm_route(
+    ministry_catalog = get_ministry_catalog()
+    ministry_selection, ministry_token_usage = _llm_select_ministries(
+        user_input=user_input,
         response_type=response_type,
         category=category,
         urgency=urgency,
         keywords=keywords,
         normalized_region=normalized_region,
-        catalog=catalog,
+        ministry_catalog=ministry_catalog,
+    )
+    if ministry_selection is None:
+        return failure(
+            "ROUTING_FAILED",
+            "소관부처 선택을 위한 ChatOpenAI 또는 API 키를 사용할 수 없습니다.",
+            meta={
+                "model": os.environ.get("OPENAI_ROUTER_MODEL", "gpt-4o-mini"),
+                "token_usage": ministry_token_usage,
+                "usage_breakdown": {
+                    "ministry_selection": ministry_token_usage,
+                },
+            },
+        )
+
+    valid_ministry_names = {item["ministry_name"] for item in ministry_catalog}
+    selected_ministry_names: list[str] = []
+    for ministry_name in ministry_selection.selected_ministry_names:
+        if ministry_name in valid_ministry_names and ministry_name not in selected_ministry_names:
+            selected_ministry_names.append(ministry_name)
+
+    if not selected_ministry_names:
+        return failure(
+            "NO_ROUTE_FOUND",
+            "소관부처 선택 결과가 비어 있어 라우팅을 진행할 수 없습니다.",
+            meta={
+                "model": os.environ.get("OPENAI_ROUTER_MODEL", "gpt-4o-mini"),
+                "token_usage": ministry_token_usage,
+                "usage_breakdown": {
+                    "ministry_selection": ministry_token_usage,
+                },
+            },
+        )
+
+    department_catalog = get_department_catalog(selected_ministry_names)
+    department_selection, department_token_usage = _llm_select_departments(
+        user_input=user_input,
+        response_type=response_type,
+        category=category,
+        urgency=urgency,
+        keywords=keywords,
+        normalized_region=normalized_region,
+        selected_ministry_names=selected_ministry_names,
+        department_catalog=department_catalog,
+    )
+    if department_selection is None:
+        return failure(
+            "ROUTING_FAILED",
+            "담당부서 선택을 위한 ChatOpenAI 또는 API 키를 사용할 수 없습니다.",
+            meta={
+                "model": os.environ.get("OPENAI_ROUTER_MODEL", "gpt-4o-mini"),
+                "token_usage": merge_token_usage(ministry_token_usage, department_token_usage),
+                "usage_breakdown": {
+                    "ministry_selection": ministry_token_usage,
+                    "department_selection": department_token_usage,
+                },
+            },
+        )
+
+    valid_scope_keys = {item["scope_key"] for item in department_catalog}
+    selected_scope_keys: list[str] = []
+    for scope_key in department_selection.selected_scope_keys:
+        if scope_key in valid_scope_keys and scope_key not in selected_scope_keys:
+            selected_scope_keys.append(scope_key)
+
+    if not selected_scope_keys:
+        return failure(
+            "NO_ROUTE_FOUND",
+            "담당부서 선택 결과가 비어 있어 라우팅을 진행할 수 없습니다.",
+            meta={
+                "model": os.environ.get("OPENAI_ROUTER_MODEL", "gpt-4o-mini"),
+                "token_usage": merge_token_usage(ministry_token_usage, department_token_usage),
+                "usage_breakdown": {
+                    "ministry_selection": ministry_token_usage,
+                    "department_selection": department_token_usage,
+                },
+            },
+        )
+
+    candidate_records = get_records_in_scopes(selected_scope_keys, limit_per_scope=MAX_RECORDS_PER_SCOPE)
+    if not candidate_records:
+        return failure(
+            "NO_ROUTE_FOUND",
+            "선택된 담당부서 범위에서 민원 후보를 찾지 못했습니다.",
+            meta={
+                "model": os.environ.get("OPENAI_ROUTER_MODEL", "gpt-4o-mini"),
+                "token_usage": merge_token_usage(ministry_token_usage, department_token_usage),
+                "usage_breakdown": {
+                    "ministry_selection": ministry_token_usage,
+                    "department_selection": department_token_usage,
+                },
+            },
+        )
+
+    write_search_log(
+        search_query,
+        selected_ministry_names=selected_ministry_names,
+        selected_scope_keys=selected_scope_keys,
+        candidate_records=candidate_records,
+    )
+
+    decision, routing_token_usage = _llm_route(
+        user_input=user_input,
+        response_type=response_type,
+        category=category,
+        urgency=urgency,
+        keywords=keywords,
+        normalized_region=normalized_region,
+        retrieved_records=candidate_records,
     )
     if decision is None:
-        return failure("ROUTING_FAILED", "OpenAI client 또는 API 키를 사용할 수 없어 기관 라우팅을 수행할 수 없습니다.")
+        return failure(
+            "ROUTING_FAILED",
+            "최종 민원 선택을 위한 ChatOpenAI 또는 API 키를 사용할 수 없습니다.",
+            meta={
+                "model": os.environ.get("OPENAI_ROUTER_MODEL", "gpt-4o-mini"),
+                "token_usage": merge_token_usage(
+                    ministry_token_usage,
+                    department_token_usage,
+                    routing_token_usage,
+                ),
+                "usage_breakdown": {
+                    "ministry_selection": ministry_token_usage,
+                    "department_selection": department_token_usage,
+                    "record_selection": routing_token_usage,
+                },
+            },
+        )
 
-    selected_ids: list[str] = []
-    for candidate_id in decision.selected_candidate_ids:
-        if candidate_id not in selected_ids:
-            selected_ids.append(candidate_id)
-    selected_ids = [candidate_id for candidate_id in selected_ids if any(item["id"] == candidate_id for item in catalog)]
+    selected_record_ids: list[str] = []
+    available_ids = {record["record_id"] for record in candidate_records}
+    for record_id in decision.selected_record_ids:
+        if record_id in available_ids and record_id not in selected_record_ids:
+            selected_record_ids.append(record_id)
 
-    if not selected_ids:
-        return failure("NO_ROUTE_FOUND", "기관 후보 선택 결과가 비어 있어 라우팅을 완료할 수 없습니다.")
+    if not selected_record_ids:
+        return failure(
+            "NO_ROUTE_FOUND",
+            "민원 후보 선택 결과가 비어 있어 라우팅을 완료할 수 없습니다.",
+            meta={
+                "model": os.environ.get("OPENAI_ROUTER_MODEL", "gpt-4o-mini"),
+                "token_usage": merge_token_usage(
+                    ministry_token_usage,
+                    department_token_usage,
+                    routing_token_usage,
+                ),
+                "usage_breakdown": {
+                    "ministry_selection": ministry_token_usage,
+                    "department_selection": department_token_usage,
+                    "record_selection": routing_token_usage,
+                },
+            },
+        )
 
     org_service_key = _service_key()
     agency_candidates: list[dict[str, Any]] = []
     channels: list[str] = []
+    selected_records: list[dict[str, Any]] = []
 
-    for index, candidate_id in enumerate(selected_ids[:3]):
-        candidate = next(item for item in catalog if item["id"] == candidate_id)
-        verified_name = candidate["agency_name"]
+    for index, record_id in enumerate(selected_record_ids[:2]):
+        record = next(item for item in candidate_records if item["record_id"] == record_id)
+        selected_records.append(record)
+        candidate_rank = next(
+            (
+                record_index
+                for record_index, item in enumerate(candidate_records, start=1)
+                if item["record_id"] == record_id
+            ),
+            index + 1,
+        )
+
+        agency_name = str(record.get("소관부처") or "").strip() or "소관기관 확인 필요"
+        verified_name = agency_name
         institution_code = None
-        verification_name = candidate.get("verification_name")
-        if verification_name:
+        if agency_name and agency_name != "소관기관 확인 필요":
             try:
-                normalized = _normalize_agency_name(str(verification_name), org_service_key)
+                normalized = _normalize_agency_name(agency_name, org_service_key)
             except (HTTPError, URLError, json.JSONDecodeError, Exception):
                 normalized = None
             if normalized is not None:
                 verified_name = normalized["name"]
                 institution_code = normalized["org_code"]
 
-        for channel in candidate["channels"]:
+        local_unit = _extract_receiving_unit(record) or _region_label(normalized_region) or "접수 기관 확인 필요"
+        for channel in _extract_channels(record):
             if channel not in channels:
                 channels.append(channel)
 
-        confidence = max(0.4, round(float(decision.confidence) - (index * 0.08), 2))
+        confidence = max(0.35, round(float(decision.confidence) - (index * 0.08), 2))
         agency_candidates.append(
             {
                 "name": verified_name,
-                "local_unit": candidate["local_unit"],
-                "reason": f"라우팅 AI가 현재 요청과 가장 직접적으로 연결되는 후보로 선택했습니다.",
+                "local_unit": local_unit,
+                "reason": f"`{record.get('사무명', '민원 사무')}` 항목이 선택된 담당부서 범위 안에서 현재 문의와 가장 직접적으로 연결되는 민원으로 선택되었습니다.",
                 "confidence": confidence,
                 "institution_code": institution_code,
+                "minwon_record_id": record_id,
+                "minwon_name": str(record.get("사무명") or "").strip(),
+                "scope_key": record.get("scope_key"),
+                "candidate_rank": candidate_rank,
             }
         )
+
+    total_token_usage = merge_token_usage(
+        ministry_token_usage,
+        department_token_usage,
+        routing_token_usage,
+    )
 
     return success(
         {
@@ -384,10 +677,26 @@ def AgencyRoutingTool(
             "channels": channels,
             "confidence": round(float(decision.confidence), 2),
             "keywords": keywords,
+            "selected_ministry_names": selected_ministry_names,
+            "selected_scope_keys": selected_scope_keys,
+            "ministry_selection_reason": ministry_selection.reason,
+            "department_selection_reason": department_selection.reason,
             "routing_reason": decision.routing_reason,
-            "candidate_catalog_size": len(catalog),
-            "selected_candidate_ids": selected_ids[:3],
-        }
+            "search_query": search_query,
+            "candidate_records": _serialize_records_for_llm(candidate_records),
+            "selected_record_ids": selected_record_ids[:2],
+            "related_laws": _aggregate_related_laws(selected_records),
+            "required_documents": _aggregate_required_documents(selected_records),
+        },
+        meta={
+            "model": os.environ.get("OPENAI_ROUTER_MODEL", "gpt-4o-mini"),
+            "token_usage": total_token_usage,
+            "usage_breakdown": {
+                "ministry_selection": ministry_token_usage,
+                "department_selection": department_token_usage,
+                "record_selection": routing_token_usage,
+            },
+        },
     )
 
 

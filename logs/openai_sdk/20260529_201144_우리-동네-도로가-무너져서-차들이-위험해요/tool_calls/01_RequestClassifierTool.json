@@ -1,0 +1,35 @@
+{
+  "index": 1,
+  "type": "tool_call",
+  "selected_tool": "RequestClassifierTool",
+  "tool_arguments": {
+    "message": "우리 동네 도로가 무너져서 차들이 위험해요."
+  },
+  "tool_result": {
+    "ok": true,
+    "data": {
+      "response_type": "issue_resolution",
+      "category": "road_safety",
+      "urgency": "high",
+      "keywords": [
+        "도로",
+        "무너짐",
+        "위험",
+        "차량",
+        "안전"
+      ],
+      "needs_region": true,
+      "confidence": 0.9,
+      "region_text": null
+    },
+    "error": null
+  },
+  "token_usage": {
+    "input_tokens": 1214,
+    "output_tokens": 53,
+    "total_tokens": 1267
+  },
+  "logged_at": "2026-05-29T20:11:49.234129+09:00",
+  "tool_model": "gpt-4o-mini",
+  "latency_ms": 3219
+}

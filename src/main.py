@@ -17,6 +17,7 @@ from tools import (
     RequestClassifierTool as RawRequestClassifierTool,
     RequirementAndDraftTool as RawRequirementAndDraftTool,
 )
+from tools.schemas import empty_token_usage, extract_token_usage, merge_token_usage, normalize_token_usage
 
 
 MAX_TURNS = 6
@@ -144,14 +145,25 @@ class OpenAIExecutionLogger:
         step_type: str = "tool_call",
     ) -> None:
         self.tool_index += 1
+        token_usage = extract_token_usage(result)
+        tool_meta = result.get("meta") if isinstance(result, dict) else None
+        logged_result = self._strip_result_meta(result)
         record = {
             "index": self.tool_index,
             "type": step_type,
             "selected_tool": tool_name,
             "tool_arguments": arguments,
-            "tool_result": result,
+            "tool_result": logged_result,
+            "token_usage": token_usage,
             "logged_at": _iso_now(),
         }
+        if isinstance(tool_meta, dict) and tool_meta:
+            model = tool_meta.get("model")
+            usage_breakdown = tool_meta.get("usage_breakdown")
+            if model:
+                record["tool_model"] = model
+            if isinstance(usage_breakdown, dict) and usage_breakdown:
+                record["usage_breakdown"] = usage_breakdown
         if latency_ms is not None:
             record["latency_ms"] = latency_ms
         self.tool_records.append(record)
@@ -170,6 +182,9 @@ class OpenAIExecutionLogger:
     def finalize(self, final_answer: str, raw_result: dict[str, Any], stop_reason: str) -> None:
         completed_dt = datetime.now().astimezone()
         total_latency_ms = int((completed_dt - self.started_dt).total_seconds() * 1000)
+        total_token_usage = self._aggregate_total_token_usage()
+        tool_statistics = self._aggregate_tool_statistics()
+        logged_raw_result = self._strip_raw_result_tool_calls(raw_result)
         payload = {
             "user_input": self.user_input,
             "conversation_turns": self.conversation_turns,
@@ -180,12 +195,57 @@ class OpenAIExecutionLogger:
             "started_at": self.started_at,
             "completed_at": completed_dt.isoformat(),
             "total_latency_ms": total_latency_ms,
-            "raw_result": raw_result,
+            "total_token_usage": total_token_usage,
+            "tool_statistics": tool_statistics,
+            "raw_result": logged_raw_result,
         }
         (self.run_dir / "run.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         self._write_summary(payload)
 
+    def _strip_result_meta(self, result: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(result, dict):
+            return result
+
+        stripped = dict(result)
+        stripped.pop("meta", None)
+        return stripped
+
+    def _strip_raw_result_tool_calls(self, raw_result: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(raw_result, dict):
+            return raw_result
+
+        stripped = dict(raw_result)
+        stripped.pop("turn_tool_calls", None)
+        return stripped
+
+    def _aggregate_total_token_usage(self) -> dict[str, int]:
+        return merge_token_usage(*(record.get("token_usage") for record in self.tool_records))
+
+    def _aggregate_tool_statistics(self) -> list[dict[str, Any]]:
+        stats_by_tool: dict[str, dict[str, Any]] = {}
+        for record in self.tool_records:
+            tool_name = str(record.get("selected_tool") or "unknown")
+            tool_stats = stats_by_tool.setdefault(
+                tool_name,
+                {
+                    "tool_name": tool_name,
+                    "call_count": 0,
+                    "latency_ms": 0,
+                    "token_usage": empty_token_usage(),
+                },
+            )
+            tool_stats["call_count"] += 1
+            tool_stats["latency_ms"] += int(record.get("latency_ms", 0) or 0)
+            tool_stats["token_usage"] = merge_token_usage(
+                tool_stats["token_usage"],
+                record.get("token_usage"),
+            )
+
+        return sorted(stats_by_tool.values(), key=lambda item: item["tool_name"])
+
     def _write_summary(self, payload: dict[str, Any]) -> None:
+        total_token_usage = normalize_token_usage(payload.get("total_token_usage"))
+        tool_statistics = payload.get("tool_statistics") or []
         lines = [
             "# OpenAI SDK 실행 로그",
             "",
@@ -217,14 +277,281 @@ class OpenAIExecutionLogger:
                 "## total latency",
                 "",
                 f"{payload['total_latency_ms']} ms",
+                "",
+                "## token statistics",
+                "",
+                f"- 총 tool 호출 수: {len(payload['tool_call_sequence'])}",
+                f"- 총 input tokens: {total_token_usage['input_tokens']}",
+                f"- 총 output tokens: {total_token_usage['output_tokens']}",
+                f"- 총 total tokens: {total_token_usage['total_tokens']}",
             ]
         )
+
+        if total_token_usage.get("reasoning_tokens"):
+            lines.append(f"- 총 reasoning tokens: {total_token_usage['reasoning_tokens']}")
+        if total_token_usage.get("cached_input_tokens"):
+            lines.append(f"- 총 cached input tokens: {total_token_usage['cached_input_tokens']}")
+
+        lines.extend(
+            [
+                "",
+                "## tool statistics",
+                "",
+            ]
+        )
+
+        if tool_statistics:
+            for tool_stat in tool_statistics:
+                token_usage = normalize_token_usage(tool_stat.get("token_usage"))
+                lines.append(
+                    f"- `{tool_stat['tool_name']}`: calls={tool_stat['call_count']}, "
+                    f"latency={tool_stat['latency_ms']} ms, "
+                    f"input={token_usage['input_tokens']}, "
+                    f"output={token_usage['output_tokens']}, "
+                    f"total={token_usage['total_tokens']}"
+                )
+        else:
+            lines.append("호출된 tool이 없습니다.")
 
         (self.run_dir / "summary.md").write_text("\n".join(lines), encoding="utf-8")
 
 
 def _sdk_instructions() -> str:
     return _read_prompt("openai_sdk_agent_instructions.txt")
+
+
+def _latest_logged_tool_result(
+    logger: Optional[OpenAIExecutionLogger],
+    tool_name: str,
+) -> Optional[dict[str, Any]]:
+    if logger is None:
+        return None
+
+    for record in reversed(logger.tool_records):
+        if record.get("selected_tool") == tool_name:
+            result = record.get("tool_result")
+            if isinstance(result, dict):
+                return result
+    return None
+
+
+def _log_manual_tool_call(
+    logger: Optional[OpenAIExecutionLogger],
+    tool_name: str,
+    arguments: dict[str, Any],
+    result: dict[str, Any],
+    latency_ms: int,
+) -> None:
+    if logger is None:
+        return
+    logger.log_tool_call(tool_name, arguments, result, latency_ms=latency_ms)
+
+
+def _build_forced_routing_answer(
+    routing_result: dict[str, Any],
+    draft_result: Optional[dict[str, Any]],
+) -> str:
+    routing_data = routing_result.get("data") or {}
+    agency_candidates = routing_data.get("agency_candidates") or []
+    if not agency_candidates:
+        return "죄송합니다. 소관 기관을 특정하지 못했습니다. 현재 가능한 일반 안내만 제공해 주세요."
+
+    primary = agency_candidates[0]
+    agency_name = str(primary.get("name") or "소관 기관")
+    local_unit = str(primary.get("local_unit") or "").strip()
+    channels = routing_data.get("channels") or []
+    minwon_name = str(primary.get("minwon_name") or "").strip()
+    related_laws = routing_data.get("related_laws") or []
+    required_documents = routing_data.get("required_documents") or []
+
+    lines = []
+    if local_unit:
+        lines.append(f"문의하신 내용은 우선 `{agency_name}`의 `{local_unit}`로 안내하는 것이 적절합니다.")
+    else:
+        lines.append(f"문의하신 내용은 우선 `{agency_name}`로 안내하는 것이 적절합니다.")
+
+    if minwon_name:
+        lines.append(f"현재 질문과 가장 직접적으로 연결된 민원 사무는 `{minwon_name}`입니다.")
+
+    if channels:
+        lines.append("")
+        lines.append("접수 채널:")
+        for channel in channels[:5]:
+            lines.append(f"- {channel}")
+
+    if related_laws:
+        lines.append("")
+        lines.append("관련 법령:")
+        for item in related_laws[:5]:
+            lines.append(f"- {item}")
+
+    if required_documents:
+        lines.append("")
+        lines.append("구비 서류:")
+        for item in required_documents[:5]:
+            lines.append(f"- {item}")
+
+    if draft_result and draft_result.get("ok"):
+        draft_data = draft_result.get("data") or {}
+        required_info = draft_data.get("required_info") or []
+        cautions = draft_data.get("cautions") or []
+
+        if required_info:
+            lines.append("")
+            lines.append("준비 정보:")
+            for item in required_info[:5]:
+                lines.append(f"- {item}")
+
+        if cautions:
+            lines.append("")
+            lines.append("주의사항:")
+            for item in cautions[:4]:
+                lines.append(f"- {item}")
+
+    return "\n".join(lines)
+
+
+def _append_routing_reference_sections(
+    final_output: str,
+    routing_result: Optional[dict[str, Any]],
+) -> str:
+    if not routing_result or not routing_result.get("ok"):
+        return final_output
+
+    routing_data = routing_result.get("data") or {}
+    related_laws = routing_data.get("related_laws") or []
+    required_documents = routing_data.get("required_documents") or []
+
+    sections: list[str] = []
+
+    if related_laws and "관련 법령:" not in final_output:
+        sections.append("관련 법령:")
+        for item in related_laws[:5]:
+            sections.append(f"- {item}")
+
+    if required_documents and "구비 서류:" not in final_output and "구비서류" not in final_output:
+        sections.append("구비 서류:")
+        for item in required_documents[:5]:
+            sections.append(f"- {item}")
+
+    if not sections:
+        return final_output
+
+    return final_output.rstrip() + "\n\n" + "\n".join(sections)
+
+
+def _run_forced_agency_routing_if_needed(
+    *,
+    user_input: str,
+    logger: Optional[OpenAIExecutionLogger],
+    start_index: int,
+) -> Optional[dict[str, Any]]:
+    recent_tool_calls = logger.tool_records[start_index:] if logger is not None else []
+    if any(record.get("selected_tool") == "AgencyRoutingTool" for record in recent_tool_calls):
+        return None
+
+    classifier_result = _latest_logged_tool_result(logger, "RequestClassifierTool")
+    if classifier_result is None:
+        arguments = {"message": user_input}
+        started = time.perf_counter()
+        classifier_result = RawRequestClassifierTool(user_input)
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        _log_manual_tool_call(logger, "RequestClassifierTool", arguments, classifier_result, latency_ms)
+
+    if not classifier_result.get("ok"):
+        return None
+
+    classifier_data = classifier_result.get("data") or {}
+    response_type = str(classifier_data.get("response_type") or "")
+    category = str(classifier_data.get("category") or "")
+    urgency = str(classifier_data.get("urgency") or "normal")
+    keywords = list(classifier_data.get("keywords") or [])
+    region_text = classifier_data.get("region_text")
+    confidence = float(classifier_data.get("confidence", 1.0))
+    needs_region = bool(classifier_data.get("needs_region"))
+
+    if response_type not in {"issue_resolution", "administrative_procedure"}:
+        return None
+    if category == "unknown" or confidence < FOLLOW_UP_CONFIDENCE_THRESHOLD:
+        return None
+    if needs_region and not region_text:
+        return None
+
+    normalized_region = None
+    if region_text:
+        region_result = _latest_logged_tool_result(logger, "RegionNormalizeTool")
+        if region_result is None or not region_result.get("ok"):
+            arguments = {"region_text": region_text}
+            started = time.perf_counter()
+            region_result = RawRegionNormalizeTool(region_text)
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            _log_manual_tool_call(logger, "RegionNormalizeTool", arguments, region_result, latency_ms)
+        if region_result.get("ok"):
+            normalized_region = (region_result.get("data") or {})
+
+    routing_arguments = {
+        "user_input": user_input,
+        "response_type": response_type,
+        "category": category,
+        "urgency": urgency,
+        "keywords": keywords,
+        "region_text": region_text,
+    }
+    started = time.perf_counter()
+    routing_result = RawAgencyRoutingTool(
+        user_input=user_input,
+        response_type=response_type,
+        category=category,
+        urgency=urgency,
+        keywords=keywords,
+        normalized_region=normalized_region,
+    )
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    _log_manual_tool_call(logger, "AgencyRoutingTool", routing_arguments, routing_result, latency_ms)
+
+    if not routing_result.get("ok"):
+        return {
+            "mode": "forced_agency_routing",
+            "input": user_input,
+            "last_agent": "Forced Agency Routing",
+            "final_output": "죄송합니다. 소관 기관을 자동으로 특정하지 못해 일반 안내만 가능합니다.",
+            "turn_tool_calls": logger.tool_records[start_index:] if logger is not None else [],
+        }
+
+    draft_result = None
+    routing_data = routing_result.get("data") or {}
+    agency_candidates = routing_data.get("agency_candidates") or []
+    if agency_candidates:
+        primary = agency_candidates[0]
+        agency = {
+            "name": primary.get("name"),
+            "unit": primary.get("local_unit"),
+        }
+        draft_arguments = {
+            "category": category,
+            "agency_name": agency.get("name"),
+            "agency_unit": agency.get("unit"),
+            "user_input": user_input,
+            "want_draft": True,
+        }
+        started = time.perf_counter()
+        draft_result = RawRequirementAndDraftTool(
+            category=category,
+            agency=agency,
+            user_input=user_input,
+            want_draft=True,
+        )
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        _log_manual_tool_call(logger, "RequirementAndDraftTool", draft_arguments, draft_result, latency_ms)
+
+    final_output = _build_forced_routing_answer(routing_result, draft_result)
+    return {
+        "mode": "forced_agency_routing",
+        "input": user_input,
+        "last_agent": "Forced Agency Routing",
+        "final_output": final_output,
+        "turn_tool_calls": logger.tool_records[start_index:] if logger is not None else [],
+    }
 
 
 def build_openai_agent(model: Optional[str] = None, logger: Optional[OpenAIExecutionLogger] = None) -> Any:
@@ -253,9 +580,15 @@ def build_openai_agent(model: Optional[str] = None, logger: Optional[OpenAIExecu
         logger.log_tool_call(tool_name, arguments, result, latency_ms=0)
         return json.dumps(result, ensure_ascii=False)
 
-    def _finalize_tool_result(tool_name: str, arguments: dict[str, Any], result: dict[str, Any]) -> str:
+    def _finalize_tool_result(
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: dict[str, Any],
+        *,
+        latency_ms: int,
+    ) -> str:
         if logger is not None:
-            logger.log_tool_call(tool_name, arguments, result, latency_ms=0)
+            logger.log_tool_call(tool_name, arguments, result, latency_ms=latency_ms)
         return json.dumps(result, ensure_ascii=False)
 
     @function_tool(name_override="RequestClassifierTool")
@@ -284,6 +617,7 @@ def build_openai_agent(model: Optional[str] = None, logger: Optional[OpenAIExecu
 
     @function_tool(name_override="AgencyRoutingTool")
     def agency_routing_tool(
+        user_input: str,
         response_type: str,
         category: str,
         urgency: str,
@@ -291,6 +625,7 @@ def build_openai_agent(model: Optional[str] = None, logger: Optional[OpenAIExecu
         region_text: Optional[str] = None,
     ) -> str:
         arguments = {
+            "user_input": user_input,
             "response_type": response_type,
             "category": category,
             "urgency": urgency,
@@ -309,6 +644,7 @@ def build_openai_agent(model: Optional[str] = None, logger: Optional[OpenAIExecu
 
         started = time.perf_counter()
         result = RawAgencyRoutingTool(
+            user_input=user_input,
             response_type=response_type,
             category=category,
             urgency=urgency,
@@ -414,13 +750,33 @@ def run_openai_agent(
         result = Runner.run_sync(agent, user_input, max_turns=MAX_TURNS, session=session)
 
     turn_tool_calls = logger.tool_records[start_index:] if logger is not None else []
-    return {
+    latest_routing_result = None
+    for record in reversed(turn_tool_calls):
+        if record.get("selected_tool") == "AgencyRoutingTool":
+            tool_result = record.get("tool_result")
+            if isinstance(tool_result, dict):
+                latest_routing_result = tool_result
+            break
+
+    final_output = _append_routing_reference_sections(
+        str(result.final_output),
+        latest_routing_result,
+    )
+    payload = {
         "mode": "openai_agents_sdk",
         "input": user_input,
         "last_agent": result.last_agent.name,
-        "final_output": result.final_output,
+        "final_output": final_output,
         "turn_tool_calls": turn_tool_calls,
     }
+    forced_payload = _run_forced_agency_routing_if_needed(
+        user_input=user_input,
+        logger=logger,
+        start_index=start_index,
+    )
+    if forced_payload is not None:
+        return forced_payload
+    return payload
 
 
 def _load_input(args: list[str]) -> str:
